@@ -235,6 +235,16 @@ class LocalHotCache {
     // All blocks owned by this cache (auto-cleaned on destruction)
     std::vector<std::unique_ptr<HotMemBlock>> blocks_;
 
+    // Blocks whose accessed flag was set since the last drain, so draining
+    // costs O(touched) instead of a walk over the whole LRU list.
+    std::mutex touched_mutex_;
+    std::vector<HotMemBlock*> touched_;
+    void markAccessed(HotMemBlock* blk);
+
+    // Blocks removed from the map while a reader still held them, by key.
+    // Replaces full scans of blocks_ on admission and release.
+    std::unordered_map<std::string, std::vector<HotMemBlock*>> detached_active_;
+
     // Bulk allocated memory pointer (nullptr if allocation failed)
     void* bulk_memory_standard_;
     size_t bulk_memory_size_ = 0;

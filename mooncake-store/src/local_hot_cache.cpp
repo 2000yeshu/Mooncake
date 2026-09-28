@@ -146,7 +146,7 @@ HotMemBlock* LocalHotCache::GetHotKey(const std::string& key) {
     blk->ref_count++;
 
     // Defer LRU reordering via atomic flag (drained before eviction)
-    blk->accessed.store(true, std::memory_order_relaxed);
+    markAccessed(blk);
 
     return blk;
 }
@@ -164,14 +164,20 @@ void LocalHotCache::ReleaseHotKey(const std::string& key) {
 
     // The entry may have been removed while a reader still holds the block.
     // Keep the key on active removed blocks so release can find and retire it.
-    for (auto& owned_block : blocks_) {
-        HotMemBlock* block = owned_block.get();
-        if (block && block->key_ == key && block->ref_count > 0) {
+    auto dit = detached_active_.find(key);
+    if (dit == detached_active_.end()) return;
+    auto& held = dit->second;
+    for (auto bit = held.begin(); bit != held.end(); ++bit) {
+        HotMemBlock* block = *bit;
+        if (block->key_ == key && block->ref_count > 0) {
             block->ref_count--;
-            if (block->ref_count == 0 &&
-                key_to_lru_it_.find(key) == key_to_lru_it_.end()) {
-                block->key_.clear();
-                block->accessed.store(false, std::memory_order_relaxed);
+            if (block->ref_count == 0) {
+                if (key_to_lru_it_.find(key) == key_to_lru_it_.end()) {
+                    block->key_.clear();
+                    block->accessed.store(false, std::memory_order_relaxed);
+                }
+                held.erase(bit);
+                if (held.empty()) detached_active_.erase(dit);
             }
             return;
         }
@@ -179,13 +185,7 @@ void LocalHotCache::ReleaseHotKey(const std::string& key) {
 }
 
 bool LocalHotCache::hasActiveBlockForKeyLocked(const std::string& key) const {
-    for (const auto& owned_block : blocks_) {
-        const HotMemBlock* block = owned_block.get();
-        if (block && block->key_ == key && block->ref_count > 0) {
-            return true;
-        }
-    }
-    return false;
+    return detached_active_.count(key) > 0;
 }
 
 bool LocalHotCache::removeHotKeyLocked(const std::string& key) {
@@ -201,6 +201,8 @@ bool LocalHotCache::removeHotKeyLocked(const std::string& key) {
     if (block->ref_count == 0) {
         block->key_.clear();
         block->accessed.store(false, std::memory_order_relaxed);
+    } else {
+        detached_active_[key].push_back(block);
     }
     lru_queue_.push_back(block);
 
@@ -365,9 +367,16 @@ bool LocalHotCache::TouchHotKey(const std::string& key) {
     }
     HotMemBlock* blk = *(it->second);
     if (blk) {
-        blk->accessed.store(true, std::memory_order_relaxed);
+        markAccessed(blk);
     }
     return true;
+}
+
+void LocalHotCache::markAccessed(HotMemBlock* blk) {
+    if (!blk->accessed.exchange(true, std::memory_order_relaxed)) {
+        std::lock_guard<std::mutex> lk(touched_mutex_);
+        touched_.push_back(blk);
+    }
 }
 
 HotMemBlock* LocalHotCache::GetFreeBlock() {
@@ -418,26 +427,23 @@ HotMemBlock* LocalHotCache::GetFreeBlock() {
 
 void LocalHotCache::drainDeferredTouches() {
     // Caller must hold exclusive lock on lru_mutex_.
-    // Iterate the LRU list and splice any block with accessed=true to front.
-    for (auto it = lru_queue_.begin(); it != lru_queue_.end();) {
-        HotMemBlock* blk = *it;
-        if (blk && blk->accessed.exchange(false, std::memory_order_relaxed)) {
-            if (it != lru_queue_.begin()) {
-                auto cur = it++;
-                lru_queue_.splice(lru_queue_.begin(), lru_queue_, cur);
-                // Update the map iterator
-                if (!blk->key_.empty()) {
-                    auto map_it = key_to_lru_it_.find(blk->key_);
-                    if (map_it != key_to_lru_it_.end()) {
-                        map_it->second = lru_queue_.begin();
-                    }
-                }
-            } else {
-                ++it;
-            }
-        } else {
-            ++it;
+    // Splice every block touched since the last drain to the front.
+    std::vector<HotMemBlock*> touched;
+    {
+        std::lock_guard<std::mutex> lk(touched_mutex_);
+        touched.swap(touched_);
+    }
+    for (HotMemBlock* blk : touched) {
+        if (!blk->accessed.exchange(false, std::memory_order_relaxed)) {
+            continue;
         }
+        if (blk->key_.empty()) continue;
+        auto map_it = key_to_lru_it_.find(blk->key_);
+        if (map_it == key_to_lru_it_.end() || *map_it->second != blk) {
+            continue;
+        }
+        lru_queue_.splice(lru_queue_.begin(), lru_queue_, map_it->second);
+        map_it->second = lru_queue_.begin();
     }
 }
 
