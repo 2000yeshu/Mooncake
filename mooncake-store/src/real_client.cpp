@@ -1,6 +1,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/mman.h>
+#include <sys/syscall.h>
 #include <numa.h>
 #include <numaif.h>
 #include <pthread.h>
@@ -971,6 +972,22 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         const bool parallel_hugetlb_population =
             protocol == "rdma" && should_use_hugepage;
 
+        bool use_pool_shm = false;
+#ifndef USE_VRAM_SEGMENT
+        if (Environ::GetBool("MC_STORE_SEGMENT_USE_SHM", false)) {
+            if (ipc_socket_path_.empty() ||
+                !IsHostStoreSegmentProtocol(this->protocol) ||
+                !seg_numa_nodes.empty() || should_use_hugepage) {
+                LOG(WARNING) << "MC_STORE_SEGMENT_USE_SHM ignored: needs an "
+                                "IPC socket, a host protocol, no hugepage "
+                                "and no NUMA-segmented mode";
+            } else {
+                use_pool_shm = true;
+                pool_shm_epoch_ = generate_uuid().first | 1;
+            }
+        }
+#endif
+
         while (global_segment_size > 0) {
             size_t segment_size =
                 GetNextSegmentSize(global_segment_size, split_limit, alignment);
@@ -1011,6 +1028,8 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                     mapped_size = actual_size;
                 }
 #endif
+            } else if (use_pool_shm) {
+                ptr = allocate_pool_shm_segment(segment_size);
             } else {
                 ptr = allocate_buffer_allocator_memory(segment_size,
                                                        this->protocol);
@@ -1046,6 +1065,8 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                 // munmap cleanup
                 hugepage_segment_ptrs_.emplace_back(
                     ptr, HugepageSegmentDeleter{mapped_size});
+            } else if (use_pool_shm) {
+                // allocate_pool_shm_segment already tracked it
             } else {
 #ifdef USE_VRAM_SEGMENT
                 vram_segment_ptrs_.emplace_back(ptr);
@@ -1386,9 +1407,12 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
     if (!setup_segments_safe_to_free || setup_segment_memory_must_leak_) {
         for (auto &ptr : hugepage_segment_ptrs_) ptr.release();
         for (auto &ptr : segment_ptrs_) ptr.release();
+        for (auto &ptr : pool_shm_segment_ptrs_) ptr.release();
         setup_segment_memory_must_leak_ = false;
     }
     hugepage_segment_ptrs_.clear();
+    pool_shm_segment_ptrs_.clear();
+    pool_shm_epoch_ = 0;
     segment_ptrs_.clear();
     ub_segment_ptrs_.clear();
 #ifdef USE_VRAM_SEGMENT
@@ -6563,6 +6587,8 @@ int RealClient::start_ipc_server() {
             handle_ipc_shm_register(connection);
         } else if (req_type == IPC_SHM_FD_REQUEST) {
             handle_ipc_shm_fd_request(connection);
+        } else if (req_type == IPC_POOL_SHM_FD_REQUEST) {
+            handle_ipc_pool_shm_fd_request(connection);
         } else {
             LOG(ERROR) << "Unknown IPC request type: " << req_type;
         }
@@ -6651,6 +6677,155 @@ void RealClient::handle_ipc_shm_fd_request(UdsConnection &connection) {
     if (connection.sendFd(seg->fd, &resp, sizeof(resp)) < 0) {
         LOG(ERROR) << "Failed to send hot cache fd to dummy client";
     }
+}
+
+void *RealClient::allocate_pool_shm_segment(size_t size) {
+    // Cachelib needs a Slab-aligned base; reserve extra VA and map the memfd
+    // at an aligned address inside it. Pages stay lazily allocated.
+    const size_t alignment = facebook::cachelib::Slab::kSize;
+#ifdef __NR_memfd_create
+    int fd = static_cast<int>(
+        syscall(__NR_memfd_create, "mooncake_pool", MFD_CLOEXEC));
+#else
+    int fd = -1;
+#endif
+    if (fd < 0) {
+        LOG(ERROR) << "memfd_create for pool segment failed: "
+                   << strerror(errno);
+        return nullptr;
+    }
+    if (ftruncate(fd, static_cast<off_t>(size)) != 0) {
+        LOG(ERROR) << "ftruncate pool segment failed: " << strerror(errno);
+        close(fd);
+        return nullptr;
+    }
+    const size_t reserve_size = size + alignment;
+    void *reserved = mmap(nullptr, reserve_size, PROT_NONE,
+                          MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    if (reserved == MAP_FAILED) {
+        LOG(ERROR) << "Failed to reserve pool segment VA: " << strerror(errno);
+        close(fd);
+        return nullptr;
+    }
+    const uintptr_t start = reinterpret_cast<uintptr_t>(reserved);
+    const uintptr_t aligned = align_up(start, alignment);
+    void *ptr = mmap(reinterpret_cast<void *>(aligned), size,
+                     PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, 0);
+    if (ptr == MAP_FAILED) {
+        LOG(ERROR) << "Failed to map pool segment memfd: " << strerror(errno);
+        munmap(reserved, reserve_size);
+        close(fd);
+        return nullptr;
+    }
+    if (aligned > start) {
+        munmap(reserved, aligned - start);
+    }
+    const uintptr_t tail = aligned + size;
+    if (start + reserve_size > tail) {
+        munmap(reinterpret_cast<void *>(tail), start + reserve_size - tail);
+    }
+    // Only effective when shmem THP is "advise"; harmless otherwise.
+    (void)madvise(ptr, size, MADV_HUGEPAGE);
+    pool_shm_segment_ptrs_.emplace_back(ptr, PoolShmSegmentDeleter{size, fd});
+    LOG(INFO) << "Pool segment allocated via memfd, addr=" << ptr
+              << ", size=" << size << ", fd=" << fd;
+    return ptr;
+}
+
+void RealClient::handle_ipc_pool_shm_fd_request(UdsConnection &connection) {
+    PoolShmFdRequest req;
+    if (connection.recvRaw(&req, sizeof(req)) != 0) {
+        LOG(ERROR) << "Failed to read PoolShmFdRequest payload";
+        return;
+    }
+
+    PoolShmFdResponse resp{};
+    resp.status = -1;
+
+    UUID client_id{req.client_id_first, req.client_id_second};
+    {
+        std::shared_lock<std::shared_mutex> lock(dummy_client_mutex_);
+        if (shm_contexts_.find(client_id) == shm_contexts_.end()) {
+            LOG(ERROR) << "Unregistered client_id in pool fd request: "
+                       << client_id.first << ":" << client_id.second;
+            connection.sendRaw(&resp, sizeof(resp));
+            return;
+        }
+    }
+
+    if (pool_shm_segment_ptrs_.empty() ||
+        req.segment_index >= pool_shm_segment_ptrs_.size()) {
+        connection.sendRaw(&resp, sizeof(resp));
+        return;
+    }
+
+    const auto &seg = pool_shm_segment_ptrs_[req.segment_index];
+    resp.status = 0;
+    resp.segment_count = static_cast<uint32_t>(pool_shm_segment_ptrs_.size());
+    resp.shm_size = seg.get_deleter().size;
+    resp.pool_epoch = pool_shm_epoch_;
+    if (connection.sendFd(seg.get_deleter().fd, &resp, sizeof(resp)) < 0) {
+        LOG(ERROR) << "Failed to send pool segment fd to dummy client";
+    }
+}
+
+std::vector<tl::expected<std::tuple<uint32_t, uint64_t, uint64_t>, ErrorCode>>
+RealClient::batch_acquire_pool_shm(const std::vector<std::string> &keys,
+                                   uint64_t pool_epoch) {
+    std::vector<
+        tl::expected<std::tuple<uint32_t, uint64_t, uint64_t>, ErrorCode>>
+        results(keys.size(), tl::make_unexpected(ErrorCode::INVALID_PARAMS));
+    if (!client_ || keys.empty() || pool_shm_segment_ptrs_.empty() ||
+        pool_epoch != pool_shm_epoch_) {
+        return results;
+    }
+    // The zero-copy path skips the checksum pass done by BatchGet.
+    if (Environ::Get().GetStoreChecksumEnabled()) {
+        return results;
+    }
+
+    auto query_results = client_->BatchQuery(keys);
+    if (query_results.size() != keys.size()) {
+        return results;
+    }
+    const auto local_endpoints = client_->GetLocalEndpoints();
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (!query_results[i]) {
+            results[i] = tl::make_unexpected(query_results[i].error());
+            continue;
+        }
+        const auto &qr = query_results[i].value();
+        if (qr.IsLeaseExpired()) {
+            results[i] = tl::make_unexpected(ErrorCode::LEASE_EXPIRED);
+            continue;
+        }
+        results[i] = tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+        for (const auto &replica : qr.replicas) {
+            if (replica.status != ReplicaStatus::COMPLETE ||
+                !replica.is_memory_replica()) {
+                continue;
+            }
+            const auto &desc =
+                replica.get_memory_descriptor().buffer_descriptor;
+            if (!local_endpoints.count(desc.transport_endpoint_)) continue;
+            const uint64_t addr = desc.buffer_address_;
+            const uint64_t size = desc.size_;
+            for (size_t seg = 0; seg < pool_shm_segment_ptrs_.size(); ++seg) {
+                const auto base = reinterpret_cast<uint64_t>(
+                    pool_shm_segment_ptrs_[seg].get());
+                const uint64_t seg_size =
+                    pool_shm_segment_ptrs_[seg].get_deleter().size;
+                if (addr >= base && addr - base < seg_size &&
+                    size <= seg_size - (addr - base)) {
+                    results[i] = std::make_tuple(static_cast<uint32_t>(seg),
+                                                 addr - base, size);
+                    break;
+                }
+            }
+            if (results[i].has_value()) break;
+        }
+    }
+    return results;
 }
 
 std::vector<Replica::Descriptor> RealClient::get_replica_desc(

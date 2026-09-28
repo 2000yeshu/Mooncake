@@ -8,6 +8,8 @@
 #include <map>
 #include <memory>
 #include <shared_mutex>
+#include <sys/mman.h>
+#include <unistd.h>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -418,6 +420,16 @@ class RealClient : public PyClient {
     // Batch hot cache release.
     tl::expected<void, ErrorCode> batch_release_hot_cache(
         const std::vector<std::string> &keys);
+
+    // Zero-copy pool read (MC_STORE_SEGMENT_USE_SHM=1): for each key whose
+    // COMPLETE memory replica lives in one of our shm-backed segments, returns
+    // (segment_index, offset, size). Nothing is pinned on the real side; the
+    // master read lease granted by the query protects the replica from
+    // remove/evict. pool_epoch must match the epoch handed out over IPC.
+    std::vector<
+        tl::expected<std::tuple<uint32_t, uint64_t, uint64_t>, ErrorCode>>
+    batch_acquire_pool_shm(const std::vector<std::string> &keys,
+                           uint64_t pool_epoch);
 
     // Allocator-backed buffer acquire: allocates + fills, keeps handle alive.
     // Returns (dummy_addr, size).
@@ -921,8 +933,21 @@ class RealClient : public PyClient {
     };
 #endif
 
+    struct PoolShmSegmentDeleter {
+        size_t size = 0;
+        int fd = -1;
+        void operator()(void *ptr) const {
+            if (ptr && size > 0) munmap(ptr, size);
+            if (fd >= 0) close(fd);
+        }
+    };
+
     std::vector<std::unique_ptr<void, HugepageSegmentDeleter>>
         hugepage_segment_ptrs_;
+    // memfd-backed global segments, shared read-only with dummy clients
+    std::vector<std::unique_ptr<void, PoolShmSegmentDeleter>>
+        pool_shm_segment_ptrs_;
+    uint64_t pool_shm_epoch_ = 0;
     std::vector<std::unique_ptr<void, SegmentDeleter>> segment_ptrs_;
     std::vector<std::unique_ptr<void, AscendSegmentDeleter>>
         ascend_segment_ptrs_;
@@ -1058,6 +1083,8 @@ class RealClient : public PyClient {
 
     void handle_ipc_shm_register(UdsConnection &connection);
     void handle_ipc_shm_fd_request(UdsConnection &connection);
+    void handle_ipc_pool_shm_fd_request(UdsConnection &connection);
+    void *allocate_pool_shm_segment(size_t size);
 
     void teardown_ascend_shm_buffer(MappedShm &shm);
     tl::expected<void, ErrorCode> setup_ascend_internal(

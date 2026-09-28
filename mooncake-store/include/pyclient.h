@@ -23,8 +23,9 @@ namespace mooncake {
 
 // IPC request type discriminator (sent as first 4 bytes on each connection)
 enum IpcRequestType : uint32_t {
-    IPC_SHM_REGISTER = 0,    // dummy → real: register a shm fd
-    IPC_SHM_FD_REQUEST = 1,  // dummy → real: request a shm fd from real
+    IPC_SHM_REGISTER = 0,         // dummy → real: register a shm fd
+    IPC_SHM_FD_REQUEST = 1,       // dummy → real: request a shm fd from real
+    IPC_POOL_SHM_FD_REQUEST = 2,  // dummy → real: request a pool segment fd
 };
 
 // Segment types for IPC_SHM_FD_REQUEST
@@ -137,6 +138,21 @@ struct ShmFdRequest {
 struct ShmFdResponse {
     int32_t status;     // 0 = success, <0 = error
     uint64_t shm_size;  // size of the shm region
+};
+
+// Payload for IPC_POOL_SHM_FD_REQUEST (MC_STORE_SEGMENT_USE_SHM=1 on real)
+struct PoolShmFdRequest {
+    uint64_t client_id_first;
+    uint64_t client_id_second;
+    uint32_t segment_index;
+};
+
+// Response for IPC_POOL_SHM_FD_REQUEST (fd sent back via SCM_RIGHTS)
+struct PoolShmFdResponse {
+    int32_t status;          // 0 = success, <0 = error
+    uint32_t segment_count;  // number of shm-backed pool segments
+    uint64_t shm_size;       // size of this segment
+    uint64_t pool_epoch;     // identifies this real client's pool instance
 };
 
 class ClientRequester {

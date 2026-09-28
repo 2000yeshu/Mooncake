@@ -279,6 +279,34 @@ class DummyClient : public PyClient {
 
     int request_hot_cache_fd();
 
+    // Read-only mapping of the real client's shm-backed pool segments
+    // (MC_STORE_SEGMENT_USE_SHM=1 on the real side). BufferHandles returned
+    // from it hold a reference, so a remap never unmaps memory in use.
+    struct PoolShmMapping {
+        struct Segment {
+            void *base = nullptr;
+            size_t size = 0;
+            int fd = -1;
+        };
+        std::vector<Segment> segments;
+        uint64_t epoch = 0;
+        ~PoolShmMapping();
+    };
+    mutable std::mutex pool_shm_mutex_;
+    std::shared_ptr<PoolShmMapping> pool_shm_;
+
+    int request_pool_shm_fds();
+    std::shared_ptr<PoolShmMapping> get_pool_shm() const {
+        std::lock_guard<std::mutex> lock(pool_shm_mutex_);
+        return pool_shm_;
+    }
+    // Fills results[i] for indices served from the pool mapping; returns the
+    // indices it could not serve.
+    std::vector<size_t> batch_get_pool_shm(
+        const std::vector<std::string> &keys,
+        const std::vector<size_t> &indices,
+        std::vector<std::shared_ptr<BufferHandle>> &results);
+
     // For high availability
     std::thread ping_thread_;
     std::atomic<bool> ping_running_{false};

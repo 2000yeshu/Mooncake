@@ -538,6 +538,10 @@ int DummyClient::setup_dummy(size_t mem_pool_size, size_t local_buffer_size,
             LOG(INFO)
                 << "Hot cache shm not available (real client may not have it)";
         }
+        if (request_pool_shm_fds() != 0) {
+            LOG(INFO) << "Pool segment shm not available (real client needs "
+                         "MC_STORE_SEGMENT_USE_SHM=1)";
+        }
     }
 
     ping_running_ = true;
@@ -564,6 +568,10 @@ int DummyClient::tearDownAll() {
     if (hot_cache_fd_ >= 0) {
         close(hot_cache_fd_);
         hot_cache_fd_ = -1;
+    }
+    {
+        std::lock_guard<std::mutex> lock(pool_shm_mutex_);
+        pool_shm_.reset();
     }
 
     if (ping_running_) {
@@ -959,6 +967,17 @@ std::shared_ptr<BufferHandle> DummyClient::get_buffer(const std::string& key) {
         }
     }
 
+    if (get_pool_shm()) {
+        std::vector<std::shared_ptr<BufferHandle>> pool_result(1, nullptr);
+        batch_get_pool_shm({key}, {0}, pool_result);
+        if (pool_result[0]) {
+            ObserveTransferMetric(TransferOperationKind::kRead, "get_buffer",
+                                  pool_result[0]->size(),
+                                  elapsed_us_since(start_time), false);
+            return pool_result[0];
+        }
+    }
+
     // Fallback: allocator-backed buffer via shm
     auto result = invoke_rpc<&RealClient::acquire_buffer_dummy,
                              std::tuple<uint64_t, size_t>>(key, client_id_);
@@ -1014,9 +1033,29 @@ std::vector<std::shared_ptr<BufferHandle>> DummyClient::batch_get_buffer(
         for (size_t i = 0; i < keys.size(); ++i) miss_indices.push_back(i);
     }
 
-    if (miss_indices.empty()) return results;
+    // Phase 2: zero-copy reads straight from the real client's pool
+    bool pool_served = false;
+    if (!miss_indices.empty() && get_pool_shm()) {
+        const size_t before = miss_indices.size();
+        miss_indices = batch_get_pool_shm(keys, miss_indices, results);
+        pool_served = miss_indices.size() < before;
+    }
 
-    // Phase 2: batch allocator acquire for misses
+    if (miss_indices.empty()) {
+        if (!pool_served) return results;
+        size_t total_bytes = 0;
+        for (const auto& result : results) {
+            if (result != nullptr) total_bytes += result->size();
+        }
+        if (total_bytes > 0) {
+            ObserveTransferMetric(TransferOperationKind::kRead,
+                                  "batch_get_buffer", total_bytes,
+                                  elapsed_us_since(start_time), true);
+        }
+        return results;
+    }
+
+    // Phase 3: batch allocator acquire for misses
     std::vector<std::string> miss_keys;
     miss_keys.reserve(miss_indices.size());
     for (size_t idx : miss_indices) {
@@ -1505,6 +1544,11 @@ void DummyClient::ping_thread_main() {
                         LOG(INFO) << "RPC connection restored";
                         ping_fail_count = 0;
                         connected_.store(true);
+                        // The real client may have restarted with a new pool
+                        if (get_pool_shm() && request_pool_shm_fds() != 0) {
+                            std::lock_guard<std::mutex> lock(pool_shm_mutex_);
+                            pool_shm_.reset();
+                        }
                         break;  // Exit reconnection loop
                     }
                 }
@@ -1579,6 +1623,105 @@ int DummyClient::request_hot_cache_fd() {
     LOG(INFO) << "Hot cache shm mapped at " << base
               << ", size=" << resp.shm_size;
     return 0;
+}
+
+DummyClient::PoolShmMapping::~PoolShmMapping() {
+    for (auto& seg : segments) {
+        if (seg.base) munmap(seg.base, seg.size);
+        if (seg.fd >= 0) close(seg.fd);
+    }
+}
+
+int DummyClient::request_pool_shm_fds() {
+    auto mapping = std::make_shared<PoolShmMapping>();
+    uint32_t segment_count = 1;
+    for (uint32_t idx = 0; idx < segment_count; ++idx) {
+        UdsConnector connector(ipc_socket_path_);
+        auto connection_result = connector.connect();
+        if (!connection_result) {
+            LOG(ERROR) << "Failed to connect IPC socket '" << ipc_socket_path_
+                       << "': " << connection_result.error();
+            return -1;
+        }
+        auto connection = std::move(connection_result.value());
+
+        IpcRequestType type = IPC_POOL_SHM_FD_REQUEST;
+        PoolShmFdRequest req{};
+        req.client_id_first = client_id_.first;
+        req.client_id_second = client_id_.second;
+        req.segment_index = idx;
+        if (connection->sendRaw(&type, sizeof(type)) < 0 ||
+            connection->sendRaw(&req, sizeof(req)) < 0) {
+            LOG(ERROR) << "Failed to send PoolShmFdRequest";
+            return -1;
+        }
+
+        PoolShmFdResponse resp{};
+        resp.status = -1;
+        int fd = connection->recvFd(&resp, sizeof(resp));
+        if (fd < 0 || resp.status != 0 || resp.segment_count == 0 ||
+            (idx > 0 && resp.pool_epoch != mapping->epoch)) {
+            if (fd >= 0) close(fd);
+            return -1;
+        }
+
+        void* base = mmap(nullptr, resp.shm_size, PROT_READ, MAP_SHARED, fd, 0);
+        if (base == MAP_FAILED) {
+            LOG(ERROR) << "Failed to mmap pool segment shm: "
+                       << strerror(errno);
+            close(fd);
+            return -1;
+        }
+        mapping->segments.push_back({base, resp.shm_size, fd});
+        mapping->epoch = resp.pool_epoch;
+        segment_count = resp.segment_count;
+        LOG(INFO) << "Pool segment " << idx << "/" << segment_count
+                  << " mapped read-only at " << base
+                  << ", size=" << resp.shm_size;
+    }
+
+    std::lock_guard<std::mutex> lock(pool_shm_mutex_);
+    pool_shm_ = std::move(mapping);
+    return 0;
+}
+
+std::vector<size_t> DummyClient::batch_get_pool_shm(
+    const std::vector<std::string>& keys, const std::vector<size_t>& indices,
+    std::vector<std::shared_ptr<BufferHandle>>& results) {
+    auto mapping = get_pool_shm();
+    if (!mapping || indices.empty()) return indices;
+
+    std::vector<std::string> req_keys;
+    req_keys.reserve(indices.size());
+    for (size_t idx : indices) req_keys.push_back(keys[idx]);
+
+    auto pool_results =
+        invoke_batch_rpc<&RealClient::batch_acquire_pool_shm,
+                         std::tuple<uint32_t, uint64_t, uint64_t>>(
+            req_keys.size(), req_keys, mapping->epoch);
+
+    std::vector<size_t> misses;
+    for (size_t i = 0; i < indices.size(); ++i) {
+        if (i >= pool_results.size() || !pool_results[i].has_value()) {
+            misses.push_back(indices[i]);
+            continue;
+        }
+        auto [seg_idx, offset, size] = pool_results[i].value();
+        if (seg_idx >= mapping->segments.size() ||
+            offset >= mapping->segments[seg_idx].size ||
+            size > mapping->segments[seg_idx].size - offset) {
+            LOG(ERROR) << "Pool shm range out of bounds: segment=" << seg_idx
+                       << " offset=" << offset << " size=" << size;
+            misses.push_back(indices[i]);
+            continue;
+        }
+        void* ptr =
+            static_cast<uint8_t*>(mapping->segments[seg_idx].base) + offset;
+        auto release = [mapping]() { (void)mapping; };
+        results[indices[i]] =
+            std::make_shared<BufferHandle>(ptr, size, std::move(release));
+    }
+    return misses;
 }
 
 }  // namespace mooncake
