@@ -1033,16 +1033,7 @@ std::vector<std::shared_ptr<BufferHandle>> DummyClient::batch_get_buffer(
         for (size_t i = 0; i < keys.size(); ++i) miss_indices.push_back(i);
     }
 
-    // Phase 2: zero-copy reads straight from the real client's pool
-    bool pool_served = false;
-    if (!miss_indices.empty() && get_pool_shm()) {
-        const size_t before = miss_indices.size();
-        miss_indices = batch_get_pool_shm(keys, miss_indices, results);
-        pool_served = miss_indices.size() < before;
-    }
-
-    if (miss_indices.empty()) {
-        if (!pool_served) return results;
+    auto observe_read = [&]() {
         size_t total_bytes = 0;
         for (const auto& result : results) {
             if (result != nullptr) total_bytes += result->size();
@@ -1052,6 +1043,18 @@ std::vector<std::shared_ptr<BufferHandle>> DummyClient::batch_get_buffer(
                                   "batch_get_buffer", total_bytes,
                                   elapsed_us_since(start_time), true);
         }
+    };
+
+    // Phase 2: zero-copy reads straight from the real client's pool
+    bool pool_served = false;
+    if (!miss_indices.empty() && get_pool_shm()) {
+        const size_t before = miss_indices.size();
+        miss_indices = batch_get_pool_shm(keys, miss_indices, results);
+        pool_served = miss_indices.size() < before;
+    }
+
+    if (miss_indices.empty()) {
+        if (pool_served) observe_read();
         return results;
     }
 
@@ -1079,17 +1082,7 @@ std::vector<std::shared_ptr<BufferHandle>> DummyClient::batch_get_buffer(
             std::make_shared<BufferHandle>(ptr, size, std::move(release));
     }
 
-    size_t total_bytes = 0;
-    for (const auto& result : results) {
-        if (result != nullptr) {
-            total_bytes += result->size();
-        }
-    }
-    if (total_bytes > 0) {
-        ObserveTransferMetric(TransferOperationKind::kRead, "batch_get_buffer",
-                              total_bytes, elapsed_us_since(start_time), true);
-    }
-
+    observe_read();
     return results;
 }
 
